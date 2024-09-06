@@ -11,6 +11,7 @@
 
 //! Esplora by way of `minreq` HTTP client.
 
+use core::panic;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -27,7 +28,27 @@ use bitcoin::{
     block::Header as BlockHeader, Block, BlockHash, MerkleBlock, Script, Transaction, Txid,
 };
 
-use crate::{BlockStatus, BlockSummary, Builder, Error, MerkleProof, OutputStatus, Tx, TxStatus};
+use crate::{
+    BlockStatus, BlockSummary, Builder, Error, HttpRequest, MerkleProof, OutputStatus,
+    ResponseError, Tx, TxStatus,
+};
+
+pub fn call_with_minreq<R: HttpRequest>(
+    url_base: &str,
+    request: R,
+) -> Result<R::Output, ResponseError<minreq::Error>> {
+    let req = match request.request_method() {
+        "GET" => minreq::get(format!("{}{}", url_base, request.request_url_path())),
+        "POST" => minreq::post(format!("{}{}", url_base, request.request_url_path())),
+        unhandled_request_method => {
+            panic!("unexpected request method: {}", unhandled_request_method)
+        }
+    }
+    .with_body(request.request_body());
+
+    let resp = req.send().map_err(ResponseError::Client)?;
+    R::parse_response(resp.status_code, resp.as_bytes())
+}
 
 #[derive(Debug, Clone)]
 pub struct BlockingClient {

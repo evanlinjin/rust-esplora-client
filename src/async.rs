@@ -26,12 +26,36 @@ use log::{debug, error, info, trace};
 
 use reqwest::{header, Client, StatusCode};
 
-use crate::{BlockStatus, BlockSummary, Builder, Error, MerkleProof, OutputStatus, Tx, TxStatus};
+use crate::{
+    BlockStatus, BlockSummary, Builder, Error, HttpRequest, MerkleProof, OutputStatus,
+    ResponseError, Tx, TxStatus,
+};
 
 #[derive(Debug, Clone)]
 pub struct AsyncClient {
     url: String,
     client: Client,
+}
+
+pub async fn call_with_reqwest<R: HttpRequest>(
+    client: Client,
+    url_base: &str,
+    request: R,
+) -> Result<R::Output, ResponseError<reqwest::Error>> {
+    let method =
+        reqwest::Method::from_str(request.request_method()).expect("request method must be valid");
+    let resp = client
+        .request(
+            method,
+            &format!("{}{}", url_base, request.request_url_path()),
+        )
+        .body(request.request_body().to_vec())
+        .send()
+        .await
+        .map_err(ResponseError::Client)?;
+    let status = resp.status().as_u16() as i32;
+    let body = resp.bytes().await.map_err(ResponseError::Client)?.to_vec();
+    R::parse_response(status, &body)
 }
 
 impl AsyncClient {

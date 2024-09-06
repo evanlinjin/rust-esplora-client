@@ -9,7 +9,87 @@ pub use bitcoin::{
     transaction, Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness,
 };
 
+use hex::DisplayHex;
 use serde::Deserialize;
+
+pub enum ResponseError<E> {
+    Json(serde_json::Error),
+    HttpStatus { status: i32, body: Vec<u8> },
+    Client(E),
+}
+
+pub trait HttpRequest {
+    type Output: for<'a> serde::de::Deserialize<'a>;
+
+    fn request_url_path(&self) -> String;
+    fn request_method(&self) -> &str;
+    fn request_body(&self) -> Vec<u8>;
+    fn parse_response<E>(status: i32, body: &[u8]) -> Result<Self::Output, ResponseError<E>>;
+}
+
+pub struct GetTx {
+    pub txid: Txid,
+}
+
+impl HttpRequest for GetTx {
+    type Output = Option<Transaction>;
+
+    fn request_url_path(&self) -> String {
+        format!("/tx/{}/raw", self.txid)
+    }
+
+    fn request_method(&self) -> &str {
+        "GET"
+    }
+
+    fn request_body(&self) -> Vec<u8> {
+        Vec::with_capacity(0)
+    }
+
+    fn parse_response<E>(status: i32, body: &[u8]) -> Result<Self::Output, ResponseError<E>> {
+        match status {
+            200 => Ok(serde_json::from_slice(body).map_err(ResponseError::Json)?),
+            404 => Ok(None),
+            error_status => Err(ResponseError::HttpStatus {
+                status: error_status,
+                body: body.to_vec(),
+            }),
+        }
+    }
+}
+
+pub struct PostTx {
+    pub tx: Transaction,
+}
+
+impl HttpRequest for PostTx {
+    type Output = ();
+
+    fn request_url_path(&self) -> String {
+        "/tx".to_string()
+    }
+
+    fn request_method(&self) -> &str {
+        "POST"
+    }
+
+    fn request_body(&self) -> Vec<u8> {
+        bitcoin::consensus::encode::serialize(&self.tx)
+            .to_lower_hex_string()
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn parse_response<E>(status: i32, body: &[u8]) -> Result<Self::Output, ResponseError<E>> {
+        match status {
+            200 => Ok(()),
+            error_status => Err(ResponseError::HttpStatus {
+                status: error_status,
+                body: body.to_vec(),
+            }),
+        }
+    }
+}
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PrevOut {
