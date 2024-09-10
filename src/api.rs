@@ -2,6 +2,9 @@
 //!
 //! see: <https://github.com/Blockstream/esplora/blob/master/API.md>
 
+use std::future::Future;
+use std::pin::Pin;
+
 pub use bitcoin::consensus::{deserialize, serialize};
 pub use bitcoin::hex::FromHex;
 use bitcoin::Weight;
@@ -12,48 +15,101 @@ pub use bitcoin::{
 use hex::DisplayHex;
 use serde::Deserialize;
 
-pub enum ResponseError<E> {
+pub enum ParseResponseError {
     Json(serde_json::Error),
-    HttpStatus { status: i32, body: Vec<u8> },
-    Client(E),
+    UnhandledStatus(i32),
 }
 
-pub trait HttpRequest {
+#[derive(Debug)]
+pub enum SendError<E> {
+    Client(E),
+    UnhandledStatus(i32, Vec<u8>),
+    Parse(i32, serde_json::Error),
+}
+
+pub type Request = (&'static str, String, Vec<u8>);
+
+type FutureResult<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
+pub trait ClientRequest: Sized {
     type Output: for<'a> serde::de::Deserialize<'a>;
 
-    fn request_url_path(&self) -> String;
-    fn request_method(&self) -> &str;
-    fn request_body(&self) -> Vec<u8>;
-    fn parse_response<E>(status: i32, body: &[u8]) -> Result<Self::Output, ResponseError<E>>;
+    fn request(&self) -> Request;
+
+    fn parse_response(&self, status: i32, body: &[u8]) -> Result<Self::Output, ParseResponseError>;
+
+    fn send<F, E>(&self, handle: &mut F) -> Result<Self::Output, SendError<E>>
+    where
+        F: FnMut(&'static str, String, Vec<u8>) -> Result<(i32, Vec<u8>), E>,
+    {
+        let (req_method, req_path, req_body) = self.request();
+        let (resp_status, resp_body) =
+            handle(req_method, req_path, req_body).map_err(SendError::Client)?;
+        self.parse_response(resp_status, resp_body.as_ref())
+            .map_err(|err| match err {
+                ParseResponseError::Json(err) => SendError::Parse(resp_status, err),
+                ParseResponseError::UnhandledStatus(status) => {
+                    SendError::UnhandledStatus(status, resp_body)
+                }
+            })
+    }
+
+    fn send_async<'a, F, E>(
+        &'a self,
+        handle: &'a mut F,
+    ) -> FutureResult<'a, Self::Output, SendError<E>>
+    where
+        F: FnMut(&'static str, String, Vec<u8>) -> FutureResult<'a, (i32, Vec<u8>), E>
+            + Send
+            + Sync,
+        Self: Sync,
+    {
+        Box::pin(async move {
+            let (req_method, req_path, req_body) = self.request();
+            let (resp_status, resp_body) = handle(req_method, req_path, req_body)
+                .await
+                .map_err(SendError::Client)?;
+            self.parse_response(resp_status, resp_body.as_ref())
+                .map_err(|err| match err {
+                    ParseResponseError::Json(err) => SendError::Parse(resp_status, err),
+                    ParseResponseError::UnhandledStatus(status) => {
+                        SendError::UnhandledStatus(status, resp_body)
+                    }
+                })
+        })
+    }
+}
+
+pub trait ClientRequestSender {
+    type Error;
 }
 
 pub struct GetTx {
     pub txid: Txid,
 }
 
-impl HttpRequest for GetTx {
+impl GetTx {
+    pub fn new(txid: Txid) -> Self {
+        Self { txid }
+    }
+}
+
+impl ClientRequest for GetTx {
     type Output = Option<Transaction>;
 
-    fn request_url_path(&self) -> String {
-        format!("/tx/{}/raw", self.txid)
+    fn request(&self) -> Request {
+        (
+            "GET",
+            format!("/tx/{}/raw", self.txid),
+            Vec::with_capacity(0),
+        )
     }
 
-    fn request_method(&self) -> &str {
-        "GET"
-    }
-
-    fn request_body(&self) -> Vec<u8> {
-        Vec::with_capacity(0)
-    }
-
-    fn parse_response<E>(status: i32, body: &[u8]) -> Result<Self::Output, ResponseError<E>> {
+    fn parse_response(&self, status: i32, body: &[u8]) -> Result<Self::Output, ParseResponseError> {
         match status {
-            200 => Ok(serde_json::from_slice(body).map_err(ResponseError::Json)?),
+            200 => Ok(serde_json::from_slice(body).map_err(ParseResponseError::Json)?),
             404 => Ok(None),
-            error_status => Err(ResponseError::HttpStatus {
-                status: error_status,
-                body: body.to_vec(),
-            }),
+            error_status => Err(ParseResponseError::UnhandledStatus(error_status)),
         }
     }
 }
@@ -62,31 +118,28 @@ pub struct PostTx {
     pub tx: Transaction,
 }
 
-impl HttpRequest for PostTx {
+impl ClientRequest for PostTx {
     type Output = ();
 
-    fn request_url_path(&self) -> String {
-        "/tx".to_string()
+    fn request(&self) -> Request {
+        (
+            "POST",
+            "/tx".to_string(),
+            bitcoin::consensus::encode::serialize(&self.tx)
+                .to_lower_hex_string()
+                .as_bytes()
+                .to_vec(),
+        )
     }
 
-    fn request_method(&self) -> &str {
-        "POST"
-    }
-
-    fn request_body(&self) -> Vec<u8> {
-        bitcoin::consensus::encode::serialize(&self.tx)
-            .to_lower_hex_string()
-            .as_bytes()
-            .to_vec()
-    }
-
-    fn parse_response<E>(status: i32, body: &[u8]) -> Result<Self::Output, ResponseError<E>> {
+    fn parse_response(
+        &self,
+        status: i32,
+        _body: &[u8],
+    ) -> Result<Self::Output, ParseResponseError> {
         match status {
             200 => Ok(()),
-            error_status => Err(ResponseError::HttpStatus {
-                status: error_status,
-                body: body.to_vec(),
-            }),
+            error_status => Err(ParseResponseError::UnhandledStatus(error_status)),
         }
     }
 }

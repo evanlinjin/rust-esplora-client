@@ -11,7 +11,6 @@
 
 //! Esplora by way of `minreq` HTTP client.
 
-use core::panic;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -29,25 +28,42 @@ use bitcoin::{
 };
 
 use crate::{
-    BlockStatus, BlockSummary, Builder, Error, HttpRequest, MerkleProof, OutputStatus,
-    ResponseError, Tx, TxStatus,
+    BlockStatus, BlockSummary, Builder, ClientRequest, Error, GetTx, MerkleProof, OutputStatus, Tx,
+    TxStatus,
 };
 
-pub fn call_with_minreq<R: HttpRequest>(
-    url_base: &str,
-    request: R,
-) -> Result<R::Output, ResponseError<minreq::Error>> {
-    let req = match request.request_method() {
-        "GET" => minreq::get(format!("{}{}", url_base, request.request_url_path())),
-        "POST" => minreq::post(format!("{}{}", url_base, request.request_url_path())),
-        unhandled_request_method => {
-            panic!("unexpected request method: {}", unhandled_request_method)
-        }
-    }
-    .with_body(request.request_body());
+pub type MinreqMiddleware = Box<dyn Fn(minreq::Request) -> minreq::Request>;
 
-    let resp = req.send().map_err(ResponseError::Client)?;
-    R::parse_response(resp.status_code, resp.as_bytes())
+pub fn no_middleware() -> MinreqMiddleware {
+    Box::new(|r| r)
+}
+
+pub fn make_minreq_handler<'a>(
+    url_base: &'a str,
+    middleware: MinreqMiddleware,
+) -> impl FnMut(&'static str, String, Vec<u8>) -> Result<(i32, Vec<u8>), minreq::Error> + 'a {
+    move |req_method, req_path, req_body| {
+        let mut req = minreq::Request::new(
+            match req_method {
+                "GET" => minreq::Method::Get,
+                "POST" => minreq::Method::Post,
+                other => minreq::Method::Custom(other.to_string()),
+            },
+            format!("{}{}", url_base, req_path),
+        );
+        req = middleware(req).with_body(req_body);
+
+        let resp = req.send()?;
+        Ok((resp.status_code, resp.as_bytes().to_vec()))
+    }
+}
+
+fn _example() {
+    let mut minreq_handler = make_minreq_handler("https:://test.com", no_middleware());
+    let txid = Txid::all_zeros();
+    GetTx::new(txid)
+        .send(&mut minreq_handler)
+        .expect("must not fail");
 }
 
 #[derive(Debug, Clone)]

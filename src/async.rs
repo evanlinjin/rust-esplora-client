@@ -27,8 +27,8 @@ use log::{debug, error, info, trace};
 use reqwest::{header, Client, StatusCode};
 
 use crate::{
-    BlockStatus, BlockSummary, Builder, Error, HttpRequest, MerkleProof, OutputStatus,
-    ResponseError, Tx, TxStatus,
+    BlockStatus, BlockSummary, Builder, ClientRequest, Error, MerkleProof, OutputStatus,
+    ParseResponseError, Tx, TxStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -37,25 +37,38 @@ pub struct AsyncClient {
     client: Client,
 }
 
-pub async fn call_with_reqwest<R: HttpRequest>(
+pub enum ReqwestError {
+    Client(reqwest::Error),
+    UnhandledStatus(reqwest::StatusCode, reqwest::header::HeaderMap, Vec<u8>),
+    Parse(serde_json::Error),
+}
+
+pub async fn call_with_reqwest<R: ClientRequest>(
     client: Client,
     url_base: &str,
     request: R,
-) -> Result<R::Output, ResponseError<reqwest::Error>> {
-    let method =
-        reqwest::Method::from_str(request.request_method()).expect("request method must be valid");
+) -> Result<R::Output, ReqwestError> {
+    let (req_method, req_path, req_body) = request.request();
+
+    let method = reqwest::Method::from_str(req_method).expect("request method must be valid");
     let resp = client
-        .request(
-            method,
-            &format!("{}{}", url_base, request.request_url_path()),
-        )
-        .body(request.request_body().to_vec())
+        .request(method, &format!("{}{}", url_base, req_path))
+        .body(req_body)
         .send()
         .await
-        .map_err(ResponseError::Client)?;
-    let status = resp.status().as_u16() as i32;
-    let body = resp.bytes().await.map_err(ResponseError::Client)?.to_vec();
-    R::parse_response(status, &body)
+        .map_err(ReqwestError::Client)?;
+    let status = resp.status();
+    let status_code = status.as_u16() as i32;
+    let headers = resp.headers().clone();
+    let body = resp.bytes().await.map_err(ReqwestError::Client)?.to_vec();
+    request
+        .parse_response(status_code, &body)
+        .map_err(move |err| match err {
+            ParseResponseError::Json(json_err) => ReqwestError::Parse(json_err),
+            ParseResponseError::UnhandledStatus(_) => {
+                ReqwestError::UnhandledStatus(status, headers, body)
+            }
+        })
 }
 
 impl AsyncClient {
